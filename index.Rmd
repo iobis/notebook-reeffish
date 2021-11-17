@@ -1,0 +1,224 @@
+---
+title: Data exploration - Stratified random surveys (StRS) of reef fish in the U.S. Pacific Islands
+date: "`r Sys.Date()`"
+author: Pieter Provoost
+output: (function(...) {
+  rmdformats::robobook(toc_depth = 4, fig_caption = FALSE, pandoc_args = c("+RTS", "-K2000m", "-RTS"), ...) })
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "docs") })  
+---
+
+In this notebook we explore the [NOAA Pacific Islands Fisheries Science Center, Ecosystem Sciences Division, National Coral Reef Monitoring Program: Stratified random surveys (StRS) of reef fish in the U.S. Pacific Islands](https://obis.org/dataset/2ae2a2bd-8412-405b-8a9f-b71adc41d4c5) dataset.
+
+# Data preparation
+
+First load some packages, get the world polygons for creating maps, and initialize a cache.
+
+```{r warning=FALSE, message=FALSE}
+library(robis)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(memoise)
+library(cachem)
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+cache <- cachem::cache_disk(dir = "cache", max_size = Inf)
+```
+
+## Fetching data from the OBIS API
+
+Fetch occurrence data from OBIS and make sure to include the MeasurementOrFact records. This step can take a while, so I'm using a local cache to speed up subsequent runs.
+
+```{r warning=FALSE, message=FALSE}
+occ <- memoise(occurrence, cache = cache)(datasetid = "2ae2a2bd-8412-405b-8a9f-b71adc41d4c5", mof = TRUE)
+```
+
+## Cleanup occurrence
+
+`individualCount`s are provided as character, so first convert to numeric:
+
+```{r warning=FALSE, message=FALSE}
+occ <- occ %>%
+  mutate(individualCount = as.numeric(individualCount))
+```
+
+## Extract measurements
+
+The MeasurementOrFact records are nested inside the `mof` column, use `unnest_extension()` to extract them to a dedicated data frame.
+
+```{r warning=FALSE, message=FALSE}
+mof <- unnest_extension(occ, "MeasurementOrFact", fields = c("eventID", "scientificName", "year", "individualCount", "decimalLongitude", "decimalLatitude", "island", "islandGroup", "stateProvince"))
+```
+
+## Cleanup measurements
+
+The consumer types are a bit cryptic, so let's translate them to something human readable:
+
+```{r warning=FALSE, message=FALSE}
+mof <- mof %>%
+  mutate(measurementValue = recode(measurementValue, 
+    APEX = "apex predator",
+    Cor = "corallivore",
+    H = "herbivore",
+    MI = "mobile invertivore",
+    Om = "omnivore",
+    Par = "parrotfish",
+    Pisc = "piscivore",
+    Pk = "planktivore",
+    SI = "sessile invertivore",
+    X = "unidentified fish",
+    Z = "zooplantivore"
+  ))
+```
+
+# Data exploration
+## Time
+
+Let's take a look at the time distribution of our dataset:
+
+```{r warning=FALSE, message=FALSE}
+ggplot(data = occ) + 
+  geom_bar(aes(date_year), width = 1)
+```
+
+## Locations
+
+Check how many locations we have at different levels (station, island, island group):
+
+```{r warning=FALSE, message=FALSE}
+occ %>%
+  group_by(decimalLongitude, decimalLatitude) %>%
+  summarize(records = n()) %>%
+  arrange(desc(records))
+```
+
+```{r warning=FALSE, message=FALSE}
+occ %>%
+  group_by(island) %>%
+  summarize(records = n()) %>%
+  arrange(desc(records))
+```
+
+```{r warning=FALSE, message=FALSE}
+occ %>%
+  group_by(islandGroup) %>%
+  summarize(records = n()) %>%
+  arrange(desc(records))
+```
+
+## Count data in individualCount
+
+Let's take a look at the counts for a single species and a single island.
+
+```{r warning=FALSE, message=FALSE}
+thadup <- occ %>%
+  filter(scientificName =="Thalassoma duperrey" & island == "Midway")
+
+ggplot(thadup) +
+  geom_jitter(aes(date_year, individualCount))
+```
+
+## Measurement types
+
+Let's first take a look at all `measurementType`s and `measurementTypeID`s (if any):
+
+```{r warning=FALSE, message=FALSE}
+library(knitr)
+
+mt <- mof %>%
+  group_by(measurementType, measurementTypeID) %>%
+  summarize(records = n()) %>%
+  arrange(desc(records))
+
+mt %>%
+  kable()
+```
+
+### Trophic level
+
+Aggregate the count data by island and trophic level (Primary Consumer, Secondary Consumer, Planktivore, Piscivore):
+
+```{r warning=FALSE, message=FALSE}
+mof_trophic <- mof %>%
+  filter(measurementType == "Trophic level (Primary Consumer, Secondary Consumer, Planktivore, Piscivore)" & !is.na(individualCount)) %>%
+  mutate(measurementValue = factor(tolower(measurementValue), levels = c("piscivore", "planktivore", "secondary", "primary")))
+
+trophic_stats <- mof_trophic %>%
+  group_by(island) %>%
+  mutate(individuals = sum(individualCount)) %>%
+  group_by(island, measurementValue) %>%
+  summarize(fraction = sum(individualCount / individuals))
+
+island_order <- trophic_stats %>% filter(measurementValue == "primary") %>% arrange(fraction) %>% pull(island)
+
+trophic_stats$island <- factor(trophic_stats$island, levels = island_order)
+
+ggplot(trophic_stats) +
+  geom_bar(aes(island, fraction, fill = measurementValue), position = "stack", stat = "identity") +
+  coord_flip() +
+  labs(fill = "Trophic level") +
+  scale_fill_brewer(palette = "Paired")
+```
+
+### Consumer types
+
+Aggregate the count data by island and consumer type:
+
+```{r warning=FALSE, message=FALSE}
+mof_consumer <- mof %>%
+  filter(measurementType == "Consumer type: APEX (apex predator), Cor (corallivore), H (herbivore), MI (mobile invertivore), Om (Omnivore), Par (parrotfish), Pisc (piscivore), Pk (planktivore), SI (sessile invertivore), X (if unidentified fish), Z (zooplantivore)" & !is.na(individualCount))
+
+consumer_stats <- mof_consumer %>%
+  group_by(island) %>%
+  mutate(individuals = sum(individualCount)) %>%
+  group_by(island, measurementValue) %>%
+  summarize(fraction = sum(individualCount / individuals))
+
+ggplot(consumer_stats) +
+  geom_bar(aes(island, fraction, fill = measurementValue), position = "stack", stat = "identity") +
+  coord_flip() +
+  labs(fill = "Consumer type") +
+  scale_fill_brewer(palette = "Paired")
+```
+
+### Length
+
+Calculate mean fish length by island:
+
+```{r warning=FALSE, message=FALSE}
+mof_length <- mof %>%
+  filter(measurementType == "Fish Total Length, TL") %>%
+  mutate(measurementValue = as.numeric(measurementValue))
+
+length_stats <- mof_length %>%
+  group_by(island) %>%
+  summarize(
+    decimalLongitude = mean(decimalLongitude),
+    decimalLatitude = mean(decimalLatitude),
+    mean_length = sum(measurementValue * individualCount) / sum(individualCount),
+    median_length = median(rep(measurementValue, individualCount)),
+    q1_length = quantile(rep(measurementValue, individualCount))[2],
+    q3_length = quantile(rep(measurementValue, individualCount))[4],
+    sd_length = sd(rep(measurementValue, individualCount))
+  ) %>%
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+length_stats$island <- reorder(length_stats$island, length_stats$mean_length)
+
+ggplot() + 
+  geom_sf(data = world, color = NA) +
+  geom_sf(data = length_stats, aes(size = mean_length), fill = NA, shape = 21) +
+  scale_size(range = c(0, 6), name = "Mean fish length (cm)") +
+  theme_void()
+
+ggplot(length_stats) +
+  geom_errorbarh(aes(y = island, xmin = mean_length - sd_length, xmax = mean_length + sd_length)) +
+  geom_point(aes(y = island, x = mean_length), shape = 21, fill = "white", size = 3) +
+  geom_point(aes(y = island, x = median_length), shape = 6, fill = "white", size = 2) +
+  xlab("Fish length (cm)")
+```
+
